@@ -1,102 +1,180 @@
-import os
-import re
+"""
+Загружает и сохраняет человеческие письма и их версии отредактированные ИИ (GPT-3.5)
+в папки human и edited с одинаковыми именами парных файлов.
+При повторном запуске проверяет соответствие имён в уже существующем датасете.
+"""
+
+import argparse
+import io
+import json
+import shutil
+import sys
+import tempfile
+import urllib.request
+import zipfile
+from contextlib import contextmanager
+from email import policy
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from pathlib import Path
 
-from datasets import load_dataset
-
-
-ARCHIVE_URL = (
-    "https://huggingface.co/datasets/linzw/PASTED/"
-    "resolve/main/raw-GPT-3.5.zip"
-)
-
-TRAIN_FILE = (
-    f"zip://raw-GPT-3.5/train.json::{ARCHIVE_URL}"
-)
-
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-def sanitize_filename(name: str, max_len: int = 80) -> str:
-    # убираем недопустимые символы из имени файла
-    name = re.sub(r"[^\w\-.]+", "_", str(name))
-    return name[:max_len] or "sample"
+BASE_DIR = Path(__file__).resolve().parent
+ARCHIVE_URL = "https://huggingface.co/datasets/linzw/PASTED/resolve/main/raw-GPT-3.5.zip"
+TRAIN_MEMBER = "raw-GPT-3.5/train.json"
+REQUIRED = {"index", "precede_text", "candidate_para_text", "following_text",
+            "para_text", "label", "src"}
 
 
-def row_to_eml(row, idx: int, output_dir: str) -> str:
-    # формируем .eml файл из одной строки датасета
-    msg = EmailMessage()
+def json_rows(stream):
+    first = stream.readline()
+    if first.lstrip().startswith("["):
+        yield from json.loads(first + stream.read())
+    else:
+        if first.strip():
+            yield json.loads(first)
+        for line in stream:
+            if line.strip():
+                yield json.loads(line)
 
-    src = str(row.get("src", "unknown"))
-    label = str(row.get("label", "unknown"))
 
-    # тема письма это источник и метка
-    msg["Subject"] = f"PASTED sample #{idx + 1} | src={src} | label={label}"
-    msg["From"] = "pasted-dataset@local"
-    msg["To"] = "recipient@local"
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="pasted.local")
-    msg["X-Sample-Index"] = str(idx + 1)
-    msg["X-Source"] = src
-    msg["X-Label"] = label
+@contextmanager
+def open_rows(source):
+    if source.suffix.lower() == ".zip":
+        with zipfile.ZipFile(source) as archive:
+            with archive.open(TRAIN_MEMBER) as raw:
+                with io.TextIOWrapper(raw, encoding="utf-8-sig") as stream:
+                    yield json_rows(stream)
+    elif source.suffix.lower() in {".json", ".jsonl"}:
+        with source.open(encoding="utf-8-sig") as stream:
+            yield json_rows(stream)
+    else:
+        raise ValueError("Источник должен быть JSON, JSONL или официальным ZIP")
 
-    # тело письма это обычный текст с исходными полями
-    body = (
-        f"предшествующий текст:\n{row.get('precede_text', '')}\n\n"
-        f"кандидат на перефразирование:\n{row.get('candidate_para_text', '')}\n\n"
-        f"перефразированный текст:\n{row.get('para_text', '')}\n\n"
-        f"следующий текст:\n{row.get('following_text', '')}\n\n"
-        f"источник: {src}\n"
-        f"метка: {label}\n"
-    )
-    msg.set_content(body)
 
-    filename = f"sample_{idx + 1:05d}_{sanitize_filename(src)}.eml"
-    filepath = os.path.join(output_dir, filename)
+def clean_part(value):
+    if not isinstance(value, str):
+        raise ValueError("Текстовые поля должны содержать строки")
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    with open(filepath, "wb") as f:
-        f.write(msg.as_bytes())
 
-    return filepath
+def make_body(row, folder):
+    field = "candidate_para_text" if folder == "human" else "para_text"
+    parts = [clean_part(row[key]) for key in ("precede_text", field, "following_text")]
+    if not parts[1]:
+        raise ValueError("Пустой исходный или отредактированный фрагмент")
+    return "\n\n".join(part for part in parts if part)
+
+
+def make_eml(body, source_index, folder):
+    msg = EmailMessage(policy=policy.default)
+    msg["Subject"] = f"PASTED sample {source_index:06d}"
+    msg["From"] = "sender@example.invalid"
+    msg["To"] = "recipient@example.invalid"
+    msg["Date"] = "Mon, 01 Jan 2024 00:00:00 +0000"
+    msg["Message-ID"] = f"<pasted-{source_index:06d}-{folder}@example.invalid>"
+    msg.set_content(body, subtype="plain", charset="utf-8", cte="base64")
+    return msg.as_bytes(policy=policy.SMTP)
+
+
+def download_archive(target):
+    print("Загрузка исходного PASTED с Hugging Face...", flush=True)
+    request = urllib.request.Request(ARCHIVE_URL, headers={"User-Agent": "PASTED-EML/2.0"})
+    with urllib.request.urlopen(request, timeout=60) as response, target.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    with zipfile.ZipFile(target) as archive:
+        archive.getinfo(TRAIN_MEMBER)
+
+
+def convert(source, output_dir, limit=None):
+    if output_dir.exists():
+        raise FileExistsError(f"Папка уже существует: {output_dir}. Укажите другую --output-dir.")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".pasted-build-", dir=output_dir.parent))
+    pairs = skipped = 0
+    seen_indices = set()
+    try:
+        with tempfile.TemporaryDirectory(prefix="pasted-source-") as temp:
+            if source is None:
+                source = Path(temp) / "raw-GPT-3.5.zip"
+                download_archive(source)
+            for folder in ("human", "edited"):
+                (staging / folder).mkdir()
+            with open_rows(source) as rows:
+                for row in rows:
+                    if limit is not None and pairs >= limit:
+                        break
+                    if not isinstance(row, dict) or not REQUIRED.issubset(row):
+                        raise ValueError("Запись не содержит обязательных полей PASTED")
+                    label = str(row["label"])
+                    if label not in {"0", "1"}:
+                        raise ValueError(f"Неизвестная метка: {label}")
+                    if label == "0":
+                        skipped += 1
+                        continue
+                    if not isinstance(row["src"], str) or not row["src"].endswith("_human"):
+                        raise ValueError("Метка человеческого текста противоречит источнику")
+                    index_string = str(row["index"])
+                    if not index_string.isascii() or not index_string.isdecimal():
+                        raise ValueError(f"Неверный index: {index_string}")
+                    index = int(index_string)
+                    if index in seen_indices:
+                        raise ValueError(f"Повторяющийся index: {index}")
+                    seen_indices.add(index)
+                    filename = f"sample_{index:06d}.eml"
+                    for folder in ("human", "edited"):
+                        body = make_body(row, folder)
+                        (staging / folder / filename).write_bytes(make_eml(body, index, folder))
+                    pairs += 1
+                    if pairs % 1000 == 0:
+                        print(f"Создано пар: {pairs}", flush=True)
+            if not pairs:
+                raise ValueError("В источнике нет подходящих человеческих текстов")
+        staging.rename(output_dir)
+    except BaseException:
+        shutil.rmtree(staging)
+        raise
+    print(f"Готово: {pairs} пар, по {pairs} писем в human и edited.")
+    print(f"Пропущено машинных оригиналов: {skipped}")
+    print(f"Папка: {output_dir}")
+    return pairs
 
 
 def main():
-    print("=== загрузка raw-GPT-3.5 из датасета PASTED ===")
-
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--source", type=Path, help="Локальный JSON/JSONL или исходный ZIP")
+    cli.add_argument("--output-dir", type=Path, default=BASE_DIR / "GPT3.5_dataset")
+    cli.add_argument("--limit", type=int, help="Количество пар для пробного запуска")
+    args = cli.parse_args()
+    if args.limit is not None and args.limit < 1:
+        cli.error("--limit должен быть положительным числом")
     try:
-        train_dataset = load_dataset(
-            "json",
-            data_files={"train": TRAIN_FILE},
-            split="train",
-        )
-    except Exception as e:
-        print(f"ошибка при загрузке датасета: {e}")
-        return
-
-    df = train_dataset.to_pandas()
-
-    print(f"\n[+] загружено записей: {len(df)}")
-    print(f"[+] колонки: {list(df.columns)}")
-
-    # сохраняем .eml рядом со скриптом
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    saved = 0
-    for idx, row in df.iterrows():
-        try:
-            row_to_eml(row, idx, OUTPUT_DIR)
-            saved += 1
-        except Exception as e:
-            print(f"[!] ошибка при сохранении записи #{idx + 1}: {e}")
-
-    print(f"\n[+] сохранено .eml файлов: {saved}")
-    print(f"[+] папка: {OUTPUT_DIR}")
-
-    # оставимч и csv для удобного анализа
-    csv_path = os.path.join(OUTPUT_DIR, "raw_gpt35_dataset.csv")
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"[+] также сохранён csv: {csv_path}")
+        output_dir = args.output_dir
+        if not output_dir.is_absolute():
+            output_dir = BASE_DIR / output_dir
+        output_dir = output_dir.resolve()
+        if output_dir.exists() and args.source is None and args.limit is None:
+            for folder in ("human", "edited"):
+                if not (output_dir / folder).is_dir():
+                    raise ValueError(f"В существующем датасете нет папки {folder}: {output_dir}")
+            human_names = {p.name for p in (output_dir / "human").glob("*.eml") if p.is_file()}
+            edited_names = {p.name for p in (output_dir / "edited").glob("*.eml") if p.is_file()}
+            if not human_names or human_names != edited_names:
+                raise ValueError("Датасет неполный: папки пусты или имена пар не совпадают. "
+                                 "Для новой загрузки укажите другую --output-dir.")
+            print(f"Датасет уже загружен: {output_dir}")
+            print(f"Проверено соответствие имён: {len(human_names)} пар.")
+            print("Для сравнения случайной пары запустите test.py.")
+            return 0
+        source = args.source
+        if source is not None:
+            if not source.is_absolute():
+                source = BASE_DIR / source
+            source = source.resolve(strict=True)
+        convert(source, output_dir, args.limit)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
