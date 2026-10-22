@@ -1,0 +1,15 @@
+.venv/
+venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+datasets/
+GPT3.5_dataset/
+catboost_info/
+training/catboost_info/
+training/dataset_table.csv
+training/model_evaluation_report.png
+*.log
