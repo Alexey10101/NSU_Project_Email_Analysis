@@ -7,11 +7,14 @@
 4. Сводная таблица ключевых метрик (plt.table)
 """
 
+import sys
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE_DIR / "analysis"))
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     roc_auc_score,
@@ -144,7 +147,7 @@ def plot_results(y_test, y_pred, y_proba, feature_names, importances):
 
     plt.subplots_adjust(top=0.91, bottom=0.08, left=0.10, right=0.95, hspace=0.38, wspace=0.28)
 
-    save_path = Path(__file__).resolve().parent / "model_evaluation_report.png"
+    save_path = BASE_DIR / "training" / "model_evaluation_report.png"
     plt.savefig(save_path, dpi=300)
     print(f"\nГрафик сохранен в файл: {save_path.name}")
 
@@ -152,8 +155,8 @@ def plot_results(y_test, y_pred, y_proba, feature_names, importances):
 
 
 def train_model():
-    base_dir = Path(__file__).resolve().parent
-    table_path = base_dir / "dataset_table.csv"
+    base_dir = BASE_DIR
+    table_path = base_dir / "training" / "dataset_table.csv"
 
     if not table_path.exists():
         raise FileNotFoundError(f"Файл {table_path} не найден! Сначала запустите build_table.py")
@@ -161,14 +164,19 @@ def train_model():
     df = pd.read_csv(table_path)
     print(f"Загружено строк из таблицы: {len(df)}")
 
-    features_to_drop = ["filename", "target"]
+    features_to_drop = ["filename", "target", "group_id", "split", "text_ai_score"]
     feature_cols = [c for c in df.columns if c not in features_to_drop]
     X = df[feature_cols]
     y = df["target"]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    if "split" not in df or not {"train", "test"}.issubset(set(df["split"])):
+        raise ValueError("пересоздай таблицу через build_table.py: нужны исходные train/test")
+    # готовую оценку текстовой модели не используем как обучающий признак
+    train_mask, test_mask = df["split"] == "train", df["split"] == "test"
+    X_train, X_test = X.loc[train_mask], X.loc[test_mask]
+    y_train, y_test = y.loc[train_mask], y.loc[test_mask]
+    if set(df.loc[train_mask, "group_id"]) & set(df.loc[test_mask, "group_id"]):
+        raise ValueError("в train и test найдены общие группы")
 
     # Обучение CatBoost
     model = CatBoostClassifier(
@@ -176,7 +184,8 @@ def train_model():
         learning_rate=0.05,
         depth=4,
         random_seed=42,
-        verbose=False
+        verbose=False,
+        train_dir=str(BASE_DIR / "training" / "catboost_info")
     )
     print(">>> Идет обучение CatBoost...")
     model.fit(X_train, y_train)
@@ -190,7 +199,7 @@ def train_model():
     importances = model.get_feature_importance()
 
     # Сохраняем веса модели на диск
-    model_save_path = base_dir / "catboost_email_model.cbm"
+    model_save_path = base_dir / "models" / "catboost_email_model.cbm"
     model.save_model(str(model_save_path))
     print(f"Модель сохранена в: {model_save_path.name}")
 

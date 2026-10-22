@@ -70,8 +70,8 @@ def detect_emotional_markers(text: str) -> Dict[str, int]:
     }
 
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "text_classifier.json"
+BASE_DIR = Path(__file__).resolve().parents[1]
+MODEL_PATH = BASE_DIR / "models" / "text_classifier.json"
 FEATURE_NAMES = (
     "sentence_count", "avg_sentence_len", "sentence_len_variance", "burstiness_ratio",
     "vocab_richness_ttr", "ai_buzzwords_count", "multi_punctuation_count",
@@ -154,23 +154,37 @@ def evaluate_text_ai_probability(features: dict) -> Tuple[Optional[float], List[
     return round(classifier.probability(features) * 100.0, 1), classifier.explain(features)
 
 
+def dataset_files(dataset_dir: Path):
+    annotations = dataset_dir / "annotations.jsonl"
+    records = {}
+    if annotations.is_file():
+        with annotations.open(encoding="utf-8") as file:
+            records = {row["file"]: row for line in file if line.strip() for row in [json.loads(line)]}
+    splits = ("train", "validation", "test") if (dataset_dir / "train").is_dir() else ("",)
+    for split in splits:
+        for folder, label in (("human", 0), ("edited", 1)):
+            directory = dataset_dir / split / folder
+            if not directory.is_dir():
+                raise FileNotFoundError(f"не найдена папка: {directory}")
+            for path in sorted(directory.glob("*.eml")):
+                record = records.get(path.relative_to(dataset_dir).as_posix(), {})
+                match = re.fullmatch(r"(sample_\d+)(?:_.*)?", path.stem)
+                if not match:
+                    raise ValueError(f"не удалось определить пару: {path.name}")
+                group = record.get("group_id", match[1])
+                yield path, label, f"{split}:{group}" if split else group, split
+
+
 def read_training_data(dataset_dir: Path):
     parser = EmailParser()
     groups = {}
-    for folder, label in (("human", 0), ("edited", 1)):
-        directory = dataset_dir / folder
-        if not directory.is_dir():
-            raise FileNotFoundError(f"не найдена папка: {directory}")
-        for path in sorted(directory.glob("*.eml")):
-            match = re.fullmatch(r"(sample_\d+)(?:_.*)?", path.stem)
-            if not match:
-                raise ValueError(f"не удалось определить пару по имени: {path.name}")
-            parsed = parser.parse_from_file(str(path))
-            text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
-            if not text:
-                raise ValueError(f"письмо пустое после очистки: {path}")
-            features = extract_all_features(text, include_score=False)
-            groups.setdefault(match[1], []).append((features, label))
+    for path, label, group, _ in dataset_files(dataset_dir):
+        parsed = parser.parse_from_file(str(path))
+        text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
+        if not text:
+            raise ValueError(f"письмо пустое после очистки: {path}")
+        features = extract_all_features(text, include_score=False)
+        groups.setdefault(group, []).append((features, label))
     if len(groups) < 20 or any({label for _, label in rows} != {0, 1} for rows in groups.values()):
         raise ValueError("нужны хотя бы 20 полных групп с человеческим и отредактированным текстом")
     return groups
@@ -189,13 +203,20 @@ def collect_rows(groups, names):
     return features, labels, weights
 
 
-def train_classifier(dataset_dir: Path = BASE_DIR / "GPT3.5_dataset") -> dict:
+def train_classifier(dataset_dir: Path = BASE_DIR / "datasets" / "PASTED" / "data") -> dict:
     print("чтение писем и извлечение признаков...", flush=True)
     groups = read_training_data(dataset_dir)
     names = sorted(groups)
-    random.Random(42).shuffle(names)
-    train_end, calibration_end = int(len(names) * 0.7), int(len(names) * 0.85)
-    train_names, calibration_names, test_names = names[:train_end], names[train_end:calibration_end], names[calibration_end:]
+    if (dataset_dir / "train").is_dir():
+        train_names = [name for name in names if name.startswith("train:")]
+        calibration_names = [name for name in names if name.startswith("validation:")]
+        test_names = [name for name in names if name.startswith("test:")]
+    else:
+        random.Random(42).shuffle(names)
+        train_end, calibration_end = int(len(names) * 0.7), int(len(names) * 0.85)
+        train_names, calibration_names, test_names = names[:train_end], names[train_end:calibration_end], names[calibration_end:]
+    if not all((train_names, calibration_names, test_names)):
+        raise ValueError("нужны непустые train, validation и test")
     train_features, train_labels, train_weights = collect_rows(groups, train_names)
     calibration_features, calibration_labels, calibration_weights = collect_rows(groups, calibration_names)
     test_features, test_labels, test_weights = collect_rows(groups, test_names)

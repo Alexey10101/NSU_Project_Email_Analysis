@@ -1,65 +1,50 @@
 """
-Скрипт проходит по папкам 'human' и 'edited' датасета GPT3.5_dataset,
+собирает признаки писем из datasets/PASTED/data, сохраняет группы и разбиения,
 извлекает локальные оценки и сохраняет компактную таблицу для бустинга.
 """
 
+import sys
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE_DIR / "analysis"))
 import pandas as pd
-from text_analyze import analyze_email_from_file
+from text_analyze import analyze_email_from_file, dataset_files
 
 
 def build_meta_dataset(limit_per_class: int = None):
-    base_dir = Path(__file__).resolve().parent
-    dataset_dir = base_dir / "GPT3.5_dataset"
+    base_dir = BASE_DIR
+    dataset_dir = base_dir / "datasets" / "PASTED" / "data"
 
-    human_dir = dataset_dir / "human"
-    edited_dir = dataset_dir / "edited"
-
-    if not human_dir.exists() or not edited_dir.exists():
-        raise FileNotFoundError(
-            f"Не найден датасет в {dataset_dir}. Сначала запустите загрузку датасета!"
-        )
-
-    tasks = [
-        (human_dir, 0, "Человек"),
-        (edited_dir, 1, "ИИ (GPT-3.5)")
-    ]
+    tasks = list(dataset_files(dataset_dir))
 
     rows = []
 
     print(">>> Начинаем обработку писем для таблицы...\n")
 
-    for folder, label, label_name in tasks:
-        files = sorted(p for p in folder.glob("*.eml") if p.is_file())
-        
-        if limit_per_class:
-            files = files[:limit_per_class]
-
-        print(f"Обработка категории '{label_name}' (всего файлов: {len(files)})...")
-
-        for idx, file_path in enumerate(files, 1):
-            try:
-                features = analyze_email_from_file(str(file_path))
-
-
-                rows.append({
-                    "filename": file_path.name,
-                    "text_ai_score": features["text_ai_score"],       # Наш главный локальный скор (0-100%)
-                    "burstiness_ratio": features["burstiness_ratio"], # Ритм предложений
-                    "ai_buzzwords_count": features["ai_buzzwords_count"], # Количество клише
-                    "vocab_richness_ttr": features["vocab_richness_ttr"], # Богатство словаря
-                    "sentence_count": features["sentence_count"],     # Длина текста (в предложениях)
-                    "target": label                                   # Метка: 0 (человек) или 1 (ИИ)
-                })
-
-                if idx % 100 == 0:
-                    print(f"  Обработано {idx}/{len(files)}...")
-
-            except Exception as e:
-                print(f"Ошибка при обработке {file_path.name}: {e}")
+    counts = {}
+    for file_path, label, group, split in tasks:
+        category = (split, label)
+        if limit_per_class and counts.get(category, 0) >= limit_per_class:
+            continue
+        features = analyze_email_from_file(str(file_path))
+        rows.append({
+            "filename": file_path.name,
+            "group_id": group.rsplit(":", 1)[-1],
+            "split": split,
+            "text_ai_score": features["text_ai_score"],
+            "burstiness_ratio": features["burstiness_ratio"],
+            "ai_buzzwords_count": features["ai_buzzwords_count"],
+            "vocab_richness_ttr": features["vocab_richness_ttr"],
+            "sentence_count": features["sentence_count"],
+            "target": label
+        })
+        counts[category] = counts.get(category, 0) + 1
+        if len(rows) % 100 == 0:
+            print(f"обработано {len(rows)} писем...")
 
     df = pd.DataFrame(rows)
-    output_path = base_dir / "dataset_table.csv"
+    output_path = base_dir / "training" / "dataset_table.csv"
     df.to_csv(output_path, index=False, encoding="utf-8")
 
     print("\n" + "=" * 50)

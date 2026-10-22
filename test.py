@@ -1,10 +1,14 @@
 """
-С помощью random выбирает человеческое письмо, затем изет ему соответствующее редактированное ИИ,
+С помощью random выбирает человеческое письмо, ищет ему соответствующее редактированное ИИ,
 парсит их и выводит все признаки анализа.
 """
 
 import random
+import sys
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE_DIR / "analysis"))
 from parser import EmailParser
 from text_analyze import analyze_email_from_file
 
@@ -43,8 +47,8 @@ def compare_pair(dataset_dir: Path, filename: str) -> None:
 
 
 if __name__ == "__main__":
-    base_dir = Path(__file__).resolve().parent
-    dataset_dir = base_dir / "GPT3.5_dataset"
+    base_dir = BASE_DIR
+    dataset_dir = base_dir / "datasets" / "PASTED" / "data" / "test"
     human_emails = sorted(path for path in (dataset_dir / "human").glob("*.eml") if path.is_file())
     if not human_emails:
         raise FileNotFoundError(f"В {dataset_dir / 'human'} нет писем. Сначала запусти скрипт загрузки.")
