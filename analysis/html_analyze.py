@@ -9,22 +9,25 @@ import argparse
 import ipaddress
 import json
 import math
-import random
 import re
 import sys
 from email.utils import parseaddr
-from itertools import groupby
+from email.errors import MessageError
+import hashlib
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 from bs4 import BeautifulSoup, Comment
 from parser import EmailParser
-from text_analyze import collect_rows, dataset_files, fit_logistic, sigmoid
+from text_analyze import fit_logistic, sigmoid
+from model_utils import analyze_path, calculate_metrics, calibrate, print_error, print_json, read_dataset, save_json, split_summary
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 MODEL_PATH = BASE_DIR / "models" / "html_classifier.json"
 CALIBRATION_PATH = BASE_DIR / "models" / "html_calibration.json"
+DATASET_PATH = BASE_DIR / "datasets" / "HTML_AI" / "data"
+REPORT_PATH = BASE_DIR / "training" / "reports" / "html_metrics.json"
 FEATURE_NAMES = (
     "tags_count", "tables_count", "inline_style_ratio", "hidden_elements_count",
     "comments_count", "images_count", "links_count", "unique_domains_count",
@@ -43,6 +46,9 @@ FEATURE_LABELS = (
 
 def get_domain(url: str) -> str:
     try:
+        url = url.strip()
+        if "://" not in url and not url.startswith("//") and re.match(r"(?:www\.|[\w-]+\.[\w-]+)", url):
+            url = "https://" + url
         parsed = urlsplit(url)
         if parsed.scheme.lower() not in ("http", "https", ""):
             return ""
@@ -71,8 +77,9 @@ def calculate_html_features(soup) -> dict:
 
 def calculate_link_features(soup, plain_text: str) -> dict:
     links = [(str(tag.get("href", "")).strip(), tag.get_text(" ", strip=True)) for tag in soup.find_all("a")]
-    if not links:
-        links = [(url.rstrip(".,;!?)>"), "") for url in re.findall(r"https?://[^\s<>\"']+", plain_text)]
+    html_urls = {url for url, _ in links}
+    links.extend((url, "") for value in re.findall(r"https?://[^\s<>\"']+", plain_text)
+                 for url in [value.rstrip(".,;!?)>")] if url not in html_urls)
     domains = set()
     count = ip_count = tracking_count = mismatch_count = 0
     for url, text in links:
@@ -86,7 +93,10 @@ def calculate_link_features(soup, plain_text: str) -> dict:
             ip_count += 1
         except ValueError:
             pass
-        query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        try:
+            query = parse_qsl(urlsplit(url).query, keep_blank_values=True, max_num_fields=256)
+        except ValueError:
+            query = []
         if any(key.lower().startswith("utm_") or key.lower() in ("gclid", "fbclid") for key, _ in query):
             tracking_count += 1
         visible_domain = get_domain(text)
@@ -102,6 +112,8 @@ def calculate_link_features(soup, plain_text: str) -> dict:
 
 
 def calculate_header_features(headers: dict) -> dict:
+    headers = {str(name).lower(): value if isinstance(value, (list, tuple)) else [value]
+               for name, value in headers.items()}
     sender = parseaddr(str(headers.get("from", [""])[0]))[1].lower().rpartition("@")[2]
     reply_to = parseaddr(str(headers.get("reply-to", [""])[0]))[1].lower().rpartition("@")[2]
     return {
@@ -121,6 +133,19 @@ class HtmlClassifier:
     def __init__(self, model: dict, calibration: dict):
         if model["feature_names"] != list(FEATURE_NAMES):
             raise ValueError("список признаков изменился, нужно повторное обучение html_analyze.py")
+        if model.get("version") != 2 or calibration.get("model_id") != model.get("model_id"):
+            raise ValueError("модель и калибровка не совпадают, нужно повторное обучение")
+        for name in ("mean", "scale", "weights"):
+            if len(model[name]) != len(FEATURE_NAMES) or not all(math.isfinite(x) for x in model[name]):
+                raise ValueError(f"некорректные параметры модели: {name}")
+        if any(x <= 0 for x in model["scale"]):
+            raise ValueError("масштаб признаков должен быть положительным")
+        if not math.isfinite(model["bias"]):
+            raise ValueError("некорректное смещение модели")
+        if not all(math.isfinite(calibration[name]) for name in ("weight", "bias", "threshold")):
+            raise ValueError("повреждена калибровка")
+        if not 0 <= calibration["threshold"] <= 1 or calibration["weight"] < 0:
+            raise ValueError("некорректный порог или вес калибровки")
         self.model = model
         self.calibration = calibration
 
@@ -134,9 +159,12 @@ class HtmlClassifier:
     def probability(self, features: dict) -> float:
         return sigmoid(self.calibration["weight"] * self.decision(features) + self.calibration["bias"])
 
+    def contributions(self, features: dict) -> list:
+        return [w * x * self.calibration["weight"] for w, x in
+                zip(self.model["weights"], self.transform(features))]
+
     def explain(self, features: dict) -> list:
-        values = [w * x * self.calibration["weight"] for w, x in
-                  zip(self.model["weights"], self.transform(features))]
+        values = self.contributions(features)
         strongest = sorted(range(len(values)), key=lambda i: abs(values[i]), reverse=True)[:2]
         reasons = []
         for index in strongest:
@@ -156,124 +184,149 @@ def extract_all_features(html: str, headers: dict = None, plain_text: str = "") 
     }
 
 
-def analyze_email_from_bytes(raw_bytes: bytes, include_score: bool = True) -> dict:
+def find_evidence(html, contributions):
+    spans = []
+    names = {name for name, value in zip(FEATURE_NAMES, contributions) if abs(value) >= 0.01}
+    for match in re.finditer(r"<!--[\s\S]*?-->|<[a-zA-Z][^>]*>", html):
+        tag = match.group()
+        feature = None
+        if tag.startswith("<!--") and "comments_count" in names:
+            feature = "comments_count"
+        elif re.match(r"<a\b", tag, re.I) and "links_count" in names:
+            feature = "links_count"
+        elif re.match(r"<img\b", tag, re.I) and "images_count" in names:
+            feature = "images_count"
+        elif "style=" in tag.lower().replace(" ", "") and "inline_style_ratio" in names:
+            feature = "inline_style_ratio"
+        if feature:
+            spans.append(dict(zone="html", start=match.start(), end=match.end(), feature=feature,
+                              reason="элемент участвует в расчёте признака; это не точная разметка ИИ-правки"))
+        if len(spans) == 5:
+            break
+    return spans
+
+
+def analyze_email_from_bytes(raw_bytes: bytes, include_score: bool = True, threshold=None,
+                             model_path=MODEL_PATH, calibration_path=CALIBRATION_PATH) -> dict:
     parsed = EmailParser().parse_from_bytes(raw_bytes)
     html = parsed.text_html
     features = extract_all_features(html, parsed.headers, parsed.text_plain)
-    result = dict(subject=parsed.subject, method="html_features_logistic",
-                  has_html=bool(html), html_ai_index=None, html_ai_score=None, html_ai_verdict=None,
-                  html_ai_status="not_evaluated" if html else "no_html",
+    result = dict(subject=parsed.subject, method="html_features_logistic", has_html=bool(html),
+                  html_ai_index=None, html_ai_score=None, html_ai_verdict=None,
+                  html_ai_status="not_evaluated" if html else "no_html", html_ai_evidence=[],
                   html_ai_reasons=["оценка отключена"] if html else ["нет html-части, признаки заголовков и ссылок сохранены"],
-                  **features)
+                  parse_warnings=parsed.warnings, **features)
+    if threshold is not None and not 0 <= threshold <= 1:
+        raise ValueError("порог должен быть от 0 до 1")
     if not html or not include_score:
         return result
-    if not MODEL_PATH.is_file() or not CALIBRATION_PATH.is_file():
-        result.update(html_ai_status="not_trained", html_ai_reasons=["html-классификатор ещё не обучен"])
+    if not Path(model_path).is_file() or not Path(calibration_path).is_file():
+        result.update(html_ai_status="not_trained", html_ai_reasons=["нужны обучение на парных HTML-письмах и калибровка"])
         return result
-    classifier = HtmlClassifier(json.loads(MODEL_PATH.read_text(encoding="utf-8")),
-                                json.loads(CALIBRATION_PATH.read_text(encoding="utf-8")))
-    probability = classifier.probability(features)
-    result.update(html_ai_index=round(probability, 6), html_ai_score=round(probability * 100.0, 1),
-                  html_ai_verdict="AI-Generated" if probability >= classifier.calibration["threshold"] else "Human-Written",
-                  html_ai_status="ok", html_ai_reasons=classifier.explain(features))
+    try:
+        classifier = HtmlClassifier(json.loads(Path(model_path).read_text(encoding="utf-8")),
+                                    json.loads(Path(calibration_path).read_text(encoding="utf-8")))
+        probability = classifier.probability(features)
+        limit = classifier.calibration["threshold"] if threshold is None else threshold
+        result.update(html_ai_index=round(probability, 6), html_ai_score=round(probability * 100, 1),
+                      html_ai_verdict="AI-Edited" if probability >= limit else "Human-Written",
+                      html_ai_threshold=limit, html_ai_status="ok", html_ai_reasons=classifier.explain(features),
+                      html_ai_evidence=find_evidence(html, classifier.contributions(features)),
+                      html_ai_model_id=classifier.model["model_id"])
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
+        result.update(html_ai_status="model_error", html_ai_reasons=[f"{type(error).__name__}: {error}"])
     return result
 
 
-def analyze_email_from_file(file_path: str, include_score: bool = True) -> dict:
-    return analyze_email_from_bytes(Path(file_path).read_bytes(), include_score)
+def analyze_email_from_file(file_path: str, include_score: bool = True, **options) -> dict:
+    return analyze_email_from_bytes(Path(file_path).read_bytes(), include_score, **options)
 
 
-def calculate_metrics(probabilities, labels, weights, threshold: float) -> dict:
-    tp = fp = fn = 0.0
-    for probability, label, weight in zip(probabilities, labels, weights):
-        if probability >= threshold:
-            if label == 1:
-                tp += weight
-            else:
-                fp += weight
-        elif label == 1:
-            fn += weight
-    positive = sum(w for y, w in zip(labels, weights) if y == 1)
-    negative = sum(w for y, w in zip(labels, weights) if y == 0)
-    lower_negative = wins = 0.0
-    for _, tied in groupby(sorted(zip(probabilities, labels, weights)), key=lambda row: row[0]):
-        rows = list(tied)
-        tied_positive = sum(w for _, y, w in rows if y == 1)
-        tied_negative = sum(w for _, y, w in rows if y == 0)
-        wins += tied_positive * (lower_negative + 0.5 * tied_negative)
-        lower_negative += tied_negative
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
-    return dict(precision=precision, recall=recall,
-                f1=2 * precision * recall / (precision + recall) if precision + recall else 0.0,
-                roc_auc=wins / (positive * negative) if positive and negative else None,
-                fpr=fp / negative if negative else 0.0)
-
-
-def train_classifier(dataset_dir: Path = BASE_DIR / "datasets" / "PASTED" / "data") -> dict:
-    print("чтение писем с html...", flush=True)
-    groups = {}
-    for path, label, group, _ in dataset_files(dataset_dir):
-        values = analyze_email_from_file(str(path), include_score=False)
-        if values["has_html"]:
-            groups.setdefault(group, []).append((values, label))
-    if len(groups) < 20 or any({y for _, y in rows} != {0, 1} for rows in groups.values()):
-        raise ValueError("нужно хотя бы 20 полных групп с html в human и edited; обычный PASTED без html не подходит")
-    names = sorted(groups)
-    if (dataset_dir / "train").is_dir():
-        train_names = [name for name in names if name.startswith("train:")]
-        validation_names = [name for name in names if name.startswith("validation:")]
-        test_names = [name for name in names if name.startswith("test:")]
-    else:
-        random.Random(42).shuffle(names)
-        first, second = int(len(names) * 0.7), int(len(names) * 0.85)
-        train_names, validation_names, test_names = names[:first], names[first:second], names[second:]
-    if not all((train_names, validation_names, test_names)):
-        raise ValueError("нужны непустые train, validation и test с html")
-    train_x, train_y, train_w = collect_rows(groups, train_names)
-    validation_x, validation_y, validation_w = collect_rows(groups, validation_names)
-    test_x, test_y, test_w = collect_rows(groups, test_names)
-    vectors = [feature_vector(values) for values in train_x]
-    total = sum(train_w)
-    mean = [sum(row[i] * w for row, w in zip(vectors, train_w)) / total for i in range(len(FEATURE_NAMES))]
-    scale = [max(math.sqrt(sum(w * (row[i] - mean[i]) ** 2 for row, w in zip(vectors, train_w)) / total), 1e-8)
+def train_classifier(dataset_dir=DATASET_PATH, model_path=MODEL_PATH, calibration_path=CALIBRATION_PATH,
+                     report_path=REPORT_PATH, max_fpr=0.2) -> dict:
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise ValueError("нет парного HTML-датасета: сначала создай его через scripts/build_html_dataset.py")
+    print("чтение парных писем с html...", flush=True)
+    records = read_dataset(dataset_dir)
+    text_hashes = {}
+    for row in records:
+        values = analyze_email_from_file(str(row["path"]), include_score=False)
+        if not values["has_html"]:
+            raise ValueError(f"в парном датасете нет html: {row['filename']}")
+        parsed = EmailParser().parse_from_file(str(row["path"]))
+        digest = hashlib.sha256(re.sub(r"\s+", " ", parsed.text_html).encode("utf-8")).hexdigest()
+        if digest in text_hashes and text_hashes[digest] != row["split"]:
+            raise ValueError("одинаковый html попал в разные разбиения")
+        text_hashes[digest] = row["split"]
+        row["features"] = values
+    parts = {split: [row for row in records if row["split"] == split] for split in ("train", "validation", "test")}
+    train = parts["train"]
+    vectors = [feature_vector(row["features"]) for row in train]
+    sample_weights = [row["weight"] for row in train]
+    total = sum(sample_weights)
+    mean = [sum(v[i] * w for v, w in zip(vectors, sample_weights)) / total for i in range(len(FEATURE_NAMES))]
+    scale = [max(math.sqrt(sum(w * (v[i] - mean[i]) ** 2 for v, w in zip(vectors, sample_weights)) / total), 1e-8)
              for i in range(len(FEATURE_NAMES))]
-    scaled = [[(x - m) / s for x, m, s in zip(row, mean, scale)] for row in vectors]
-    print(f"обучение на {len(train_names)} группах...", flush=True)
-    weights, bias = fit_logistic(scaled, train_y, train_w)
-    model = dict(feature_names=list(FEATURE_NAMES), weights=weights, bias=bias, mean=mean, scale=scale, seed=42,
-                 split_groups=dict(train=train_names, validation=validation_names, test=test_names))
-    calibration = dict(weight=1.0, bias=0.0, threshold=0.5)
-    classifier = HtmlClassifier(model, calibration)
-    logits = [[classifier.decision(values)] for values in validation_x]
-    fitted, bias = fit_logistic(logits, validation_y, validation_w, epochs=400, penalty=0.001)
-    calibration.update(weight=fitted[0], bias=bias)
-    validation_p = [classifier.probability(values) for values in validation_x]
-    thresholds = sorted({0.0, 0.5, 1.0, *validation_p})
-    candidates = [(t, calculate_metrics(validation_p, validation_y, validation_w, t)) for t in thresholds]
-    calibration["threshold"] = max((row for row in candidates if row[1]["fpr"] <= 0.2),
-                                   key=lambda row: row[1]["f1"])[0]
-    probabilities = [classifier.probability(values) for values in test_x]
-    metrics = calculate_metrics(probabilities, test_y, test_w, calibration["threshold"])
-    model["metrics"] = metrics
-    MODEL_PATH.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
-    CALIBRATION_PATH.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"модель сохранена: {MODEL_PATH}")
-    print(f"калибровка сохранена: {CALIBRATION_PATH}")
+    scaled = [[(x - m) / s for x, m, s in zip(vector, mean, scale)] for vector in vectors]
+    print(f"обучение на {len(train)} письмах...", flush=True)
+    weights, bias = fit_logistic(scaled, [row["target"] for row in train], sample_weights)
+    model = dict(version=2, feature_names=list(FEATURE_NAMES), weights=weights, bias=bias, mean=mean, scale=scale,
+                 seed=42, dataset=str(dataset_dir.resolve()), splits=split_summary(records),
+                 train_groups=sorted({row["group_id"] for row in train}),
+                 scope="парные оригинальные и отредактированные HTML-письма; это не spam/ham-классификатор")
+    model["model_id"] = hashlib.sha256(json.dumps(model, sort_keys=True).encode("utf-8")).hexdigest()
+    classifier = HtmlClassifier(model, dict(model_id=model["model_id"], weight=1.0, bias=0.0, threshold=0.5))
+    validation = parts["validation"]
+    calibration = calibrate([classifier.decision(row["features"]) for row in validation],
+                            [row["target"] for row in validation], [row["weight"] for row in validation], max_fpr)
+    calibration["model_id"] = model["model_id"]
+    classifier.calibration = calibration
+    test = parts["test"]
+    metrics = calculate_metrics([classifier.probability(row["features"]) for row in test],
+                                [row["target"] for row in test], [row["weight"] for row in test], calibration["threshold"])
+    report = dict(model_id=model["model_id"], dataset=str(dataset_dir.resolve()), splits=model["splits"],
+                  validation=calibration["validation_metrics"], test=metrics, threshold=calibration["threshold"],
+                  meets_quality_target=metrics["f1"] >= 0.7 and metrics["roc_auc"] >= 0.7 and metrics["fpr"] <= 0.2,
+                  note="тест не участвовал в обучении, калибровке и выборе порога; интервалы объясняют признаки, а не заменяют локализацию ИИ")
+    save_json(model_path, model)
+    save_json(calibration_path, calibration)
+    save_json(report_path, report)
+    print(f"модель: {model_path}\nкалибровка: {calibration_path}\nотчёт: {report_path}")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    return metrics
+    return report
+
+
+def main():
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("file", nargs="?", type=Path, help="письмо или папка с eml")
+    cli.add_argument("--train", action="store_true")
+    cli.add_argument("--dataset", type=Path, default=DATASET_PATH)
+    cli.add_argument("--output", type=Path)
+    cli.add_argument("--model", type=Path, default=MODEL_PATH)
+    cli.add_argument("--calibration", type=Path, default=CALIBRATION_PATH)
+    cli.add_argument("--report", type=Path, default=REPORT_PATH)
+    cli.add_argument("--threshold", type=float)
+    cli.add_argument("--max-fpr", type=float, default=0.2)
+    args = cli.parse_args()
+    if args.train and args.file:
+        cli.error("выбери обучение или анализ письма")
+    if args.threshold is not None and not 0 <= args.threshold <= 1:
+        cli.error("--threshold должен быть от 0 до 1")
+    if not 0 <= args.max_fpr <= 1:
+        cli.error("--max-fpr должен быть от 0 до 1")
+    try:
+        if args.train or args.file is None:
+            result = train_classifier(args.dataset, args.model, args.calibration, args.report, args.max_fpr)
+        else:
+            result = analyze_path(args.file, analyze_email_from_file, "html_ai_status", threshold=args.threshold,
+                                  model_path=args.model, calibration_path=args.calibration)
+        print_json(result, args.output)
+        return 0
+    except (OSError, ValueError, KeyError, MessageError, RecursionError) as error:
+        print_error(error)
+        return 1
 
 
 if __name__ == "__main__":
-    cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("file", nargs="?", type=Path, help="письмо для анализа; без аргумента выполняется обучение")
-    cli.add_argument("--dataset", type=Path, default=BASE_DIR / "datasets" / "PASTED" / "data")
-    args = cli.parse_args()
-    try:
-        if args.file is not None:
-            print(json.dumps(analyze_email_from_file(str(args.file)), ensure_ascii=False, indent=2))
-        else:
-            train_classifier(args.dataset)
-    except (OSError, ValueError, KeyError) as error:
-        print(f"ошибка html-анализа: {error}", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(main())
