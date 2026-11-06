@@ -1,0 +1,65 @@
+{
+  "model_sha256": "6cd61203ef888e66a40d27d5c745eda099b42f935fd5d698b0a766ebd3d56e2a",
+  "mode": "feature_baseline",
+  "used_blocks": [
+    "text_features"
+  ],
+  "splits": {
+    "train": {
+      "emails": 13154,
+      "groups": 6577
+    },
+    "validation": {
+      "emails": 1714,
+      "groups": 857
+    },
+    "test": {
+      "emails": 1676,
+      "groups": 838
+    }
+  },
+  "threshold": 0.5816236553204612,
+  "validation": {
+    "precision": 0.6627218934911243,
+    "recall": 0.3920653442240373,
+    "f1": 0.4926686217008797,
+    "roc_auc": 0.664651323645345,
+    "fpr": 0.19953325554259044,
+    "accuracy": 0.5962660443407235,
+    "brier": 0.2287422009306449,
+    "confusion": {
+      "tp": 336.0,
+      "fp": 171.0,
+      "fn": 521.0,
+      "tn": 686.0
+    }
+  },
+  "test": {
+    "precision": 0.6960167714884696,
+    "recall": 0.39618138424821003,
+    "f1": 0.5049429657794676,
+    "roc_auc": 0.6725461520497149,
+    "fpr": 0.1730310262529833,
+    "accuracy": 0.6115751789976134,
+    "brier": 0.22732933131075858,
+    "confusion": {
+      "tp": 332.0,
+      "fp": 145.0,
+      "fn": 506.0,
+      "tn": 693.0
+    }
+  },
+  "feature_importance": {
+    "text_sentence_count": 15.863330335644642,
+    "text_avg_sentence_len": 23.002002240019102,
+    "text_sentence_len_variance": 12.193432387648228,
+    "text_burstiness_ratio": 11.327737513469238,
+    "text_vocab_richness_ttr": 18.452517962456824,
+    "text_ai_buzzwords_count": 13.200993209006809,
+    "text_multi_punctuation_count": 2.554136591012714,
+    "text_bracket_smiles_count": 0.03056192259063526,
+    "text_caps_words_count": 3.3752878381517983
+  },
+  "meets_quality_target": false,
+  "note": "калибровка и порог получены только на validation; test использован один раз для итоговой проверки"
+}
