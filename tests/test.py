@@ -11,6 +11,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR / "analysis"))
 from parser import EmailParser
 from text_analyze import analyze_email_from_file
+from html_analyze import analyze_email_from_file as analyze_html
+from boosting_analyze import analyze_email_from_file as analyze_boosting
 
 
 def compare_pair(dataset_dir: Path, filename: str) -> None:
@@ -44,6 +46,20 @@ def compare_pair(dataset_dir: Path, filename: str) -> None:
         for key, value in features.items():
             if key not in {"subject", "cleaned_text"}:
                 print(f"{key:26}: {value}")
+        html = analyze_html(str(path))
+        print("\nHTML-анализ:")
+        if html["html_ai_score"] is None:
+            print("; ".join(html["html_ai_reasons"]))
+        else:
+            print(f"уверенность в ИИ-правках: {html['html_ai_score']}%")
+            print("; ".join(html["html_ai_reasons"]))
+        boosting = analyze_boosting(str(path))
+        print("\nCatBoost:")
+        if boosting["ai_score"] is not None:
+            print(f"уверенность в ИИ-правках: {boosting['ai_score']}%")
+        print("; ".join(row["reason"] for row in boosting["reasons"]))
+        if boosting.get("missing_blocks"):
+            print("пока не участвуют: " + ", ".join(boosting["missing_blocks"]))
 
 
 if __name__ == "__main__":
