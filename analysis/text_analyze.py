@@ -85,7 +85,7 @@ FEATURE_LABELS = (
 
 
 def sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, value))))
+    return 1.0 / (1.0 + math.exp(-max(-35.0, min(35.0, value))))
 
 
 def feature_vector(features: dict) -> list:
