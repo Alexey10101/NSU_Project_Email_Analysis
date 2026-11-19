@@ -1,0 +1,6 @@
+-r requirements.txt
+-r ../analysis/requirements-neural.txt
+transformers>=4.56,<5
+pandas
+matplotlib
+scikit-learn
