@@ -1,7 +1,7 @@
 """
-извлекает общие признаки письма и применяет сохранённую модель catboost.
-возвращает проценты, итоговый индекс, вердикт и вклад признаков в json.
-отсутствующие нейросетевые оценки не подменяются случайными числами.
+Извлекает общие признаки письма и применяет сохранённую модель catboost.
+Возвращает проценты, итоговый индекс, вердикт и вклад признаков в json.
+Отсутствующие нейросетевые оценки не подменяются случайными числами.
 """
 
 import argparse
@@ -23,7 +23,11 @@ MODEL_PATH = BASE_DIR / "models" / "catboost_email_model.json"
 CALIBRATION_PATH = BASE_DIR / "models" / "catboost_calibration.json"
 METADATA_PATH = BASE_DIR / "models" / "catboost_metadata.json"
 FEATURE_NAMES = tuple("text_" + name for name in TEXT_FEATURES) + tuple("html_" + name for name in HTML_FEATURES) + ("has_html",)
+NEURAL_FEATURES = ("neural_discrepancy", "neural_mean_discrepancy")
 FEATURE_LABELS = dict(zip(FEATURE_NAMES, (*TEXT_LABELS, *HTML_LABELS, "наличие html")))
+
+
+FEATURE_LABELS.update(zip(NEURAL_FEATURES, ("максимальная разница предсказуемости", "средняя разница предсказуемости")))
 
 
 def email_features(raw_bytes):
@@ -46,7 +50,7 @@ class BoostingClassifier:
         digest = hashlib.sha256(Path(model_path).read_bytes()).hexdigest()
         if digest != self.metadata["model_sha256"] or digest != self.calibration["model_sha256"]:
             raise ValueError("модель catboost, описание и калибровка не совпадают")
-        if self.metadata.get("version") != 1 or not all(name in FEATURE_NAMES for name in self.metadata["feature_names"]):
+        if self.metadata.get("version") != 1 or not all(name in FEATURE_NAMES + NEURAL_FEATURES for name in self.metadata["feature_names"]):
             raise ValueError("формат признаков catboost изменился, нужно повторное обучение")
         if not 0 <= self.calibration["threshold"] <= 1:
             raise ValueError("некорректный порог catboost")
@@ -102,6 +106,20 @@ def analyze_email_from_bytes(raw_bytes, classifier=None, threshold=None):
             result["reasons"] = [dict(reason="catboost ещё не обучен: запусти training/train_boosting.py")]
             return result
         classifier = BoostingClassifier()
+    if "neural_features" in classifier.metadata["used_blocks"]:
+        from neural_roberta import get_detector
+
+        detector = get_detector()
+        settings = classifier.metadata["neural"]
+        if (detector.mask_name, detector.eval_name) != (settings["mask_model"], settings["eval_model"]):
+            raise ValueError("модель catboost обучена с другим нейросетевым анализатором")
+        text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
+        neural = detector.evaluate(text, settings["perturbations"], settings["seed"])
+        if neural["neural_discrepancy"] is None:
+            result.update(status="insufficient_text", reasons=[dict(reason="нет нейросетевых признаков для этой модели catboost")])
+            return result
+        features.update({name: neural[name] for name in NEURAL_FEATURES})
+        result["missing_blocks"].remove("нейросетевой анализ текста")
     result.update(classifier.evaluate(features, threshold), status="ok", method=classifier.metadata["mode"],
                   used_blocks=classifier.metadata["used_blocks"])
     if "html_features" not in classifier.metadata["used_blocks"]:
@@ -120,13 +138,18 @@ def main():
     cli.add_argument("file", type=Path, help="письмо или папка с eml")
     cli.add_argument("--output", type=Path)
     cli.add_argument("--threshold", type=float)
+    cli.add_argument("--models", type=Path, help="каталог экспериментального catboost")
     args = cli.parse_args()
     try:
-        classifier = BoostingClassifier() if MODEL_PATH.is_file() else None
+        if args.models is None:
+            classifier = BoostingClassifier() if MODEL_PATH.is_file() else None
+        else:
+            classifier = BoostingClassifier(args.models / MODEL_PATH.name, args.models / CALIBRATION_PATH.name,
+                                            args.models / METADATA_PATH.name)
         result = analyze_path(args.file, analyze_email_from_file, classifier=classifier, threshold=args.threshold)
         print_json(result, args.output)
         return 0
-    except (OSError, ValueError, KeyError, ImportError, MessageError, RecursionError) as error:
+    except (OSError, ValueError, KeyError, ImportError, MessageError, RuntimeError) as error:
         print_error(error)
         return 1
 
