@@ -13,7 +13,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR / "analysis"))
 
-from boosting_analyze import FEATURE_NAMES, email_features
+from boosting_analyze import FEATURE_NAMES, NEURAL_FEATURES, email_features
+from parser import clean_email_body
 from model_utils import read_dataset, save_json, split_summary
 
 
@@ -21,7 +22,10 @@ TABLE_PATH = BASE_DIR / "training" / "data" / "dataset_table.csv"
 DATASET_PATH = BASE_DIR / "datasets" / "PASTED" / "data"
 
 
-def build_meta_dataset(limit_per_class=None, dataset_dir=DATASET_PATH, output_path=TABLE_PATH):
+def build_meta_dataset(limit_per_class=None, dataset_dir=DATASET_PATH, output_path=TABLE_PATH,
+                       detector=None, perturbations=4, seed=42):
+    names = FEATURE_NAMES + (NEURAL_FEATURES if detector is not None else ())
+    skipped = set()
     datasets = dataset_dir if isinstance(dataset_dir, (list, tuple)) else [dataset_dir]
     records = []
     for directory in datasets:
@@ -51,26 +55,47 @@ def build_meta_dataset(limit_per_class=None, dataset_dir=DATASET_PATH, output_pa
                 raise ValueError("одинаковое письмо попало в разные разбиения")
             raise ValueError("одинаковое письмо включено в таблицу несколько раз")
         hashes[digest] = split
-        _, features = email_features(raw)
+        parsed, features = email_features(raw)
+        if detector is not None:
+            text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
+            neural = detector.evaluate(text, perturbations, seed)
+            if neural["neural_discrepancy"] is None:
+                skipped.add(group)
+                continue
+            features.update({name: neural[name] for name in NEURAL_FEATURES})
         if features["text_sentence_count"] == 0 and not features["has_html"]:
             raise ValueError(f"нет содержимого для обучения: {record['filename']}")
         rows.append(dict(filename=record["filename"], group_id=group, split=split, target=record["target"],
                          sample_weight=record["weight"], source_sha256=digest, **features))
         if len(rows) % 500 == 0:
             print(f"обработано {len(rows)}/{len(records)} писем...", flush=True)
+    if skipped:
+        rows = [row for row in rows if row["group_id"] not in skipped]
+        records = [row for row in records if row["group_id"] not in skipped]
+        print(f"групп без полного набора оценок: {len(skipped)}")
+    if len({row["group_id"] for row in rows}) < 20 or any(
+            {row["target"] for row in rows if row["split"] == split} != {0, 1}
+            for split in ("train", "validation", "test")):
+        raise ValueError("после отбора нужны минимум 20 полных групп и оба класса в каждом разбиении")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["filename", "group_id", "split", "target", "sample_weight", "source_sha256", *FEATURE_NAMES]
+    fields = ["filename", "group_id", "split", "target", "sample_weight", "source_sha256", *names]
     temporary = output_path.with_suffix(".csv.tmp")
     with temporary.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(output_path)
-    metadata = dict(version=1, feature_names=list(FEATURE_NAMES), datasets=[str(Path(p).resolve()) for p in datasets],
+    metadata = dict(version=1, feature_names=list(names), datasets=[str(Path(p).resolve()) for p in datasets],
                     table_sha256=hashlib.sha256(output_path.read_bytes()).hexdigest(), splits=split_summary(records),
                     mode="feature_baseline", scores_used=False,
                     note="это признаки доступных блоков; нейросетевые оценки и изображения ещё не объединяются")
+    if detector is not None:
+        metadata["neural"] = dict(mask_model=detector.mask_name, eval_model=detector.eval_name,
+                                  perturbations=perturbations, seed=seed)
+        metadata["skipped_groups"] = len(skipped)
+        metadata["mode"] = "neural_features"
+        metadata["note"] = "нейросетевые признаки рассчитаны с указанными настройками"
     save_json(output_path.with_suffix(".json"), metadata)
     print(f"таблица: {output_path}; строк: {len(rows)}")
     return metadata

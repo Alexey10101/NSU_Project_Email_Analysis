@@ -1,13 +1,14 @@
 """
-проверка нейросетевого анализа на парных письмах pasted.
-порог и калибровка подбираются на validation, итоговые метрики считаются на test.
+проверяет нейросетевой анализ на парных письмах pasted.
+калибровка и порог подбираются на validation, итоговые метрики считаются на test.
 """
 
 import argparse
 import random
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
+from time import perf_counter
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR / "analysis"))
@@ -18,67 +19,90 @@ from parser import EmailParser, clean_email_body
 from text_analyze import sigmoid
 
 
-def evaluate_split(records, split, detector, limit, perturbations, seed):
-    groups = defaultdict(list)
-    for row in records:
-        if row["split"] == split:
-            groups[row["group_id"]].append(row)
-    names = sorted(groups)
-    random.Random(seed).shuffle(names)
-
-    parser = EmailParser()
-    scores, labels, weights = [], [], []
-    total, scored = Counter(), Counter()
-    for group in names[:limit]:
-        for row in groups[group]:
-            parsed = parser.parse_from_file(str(row["path"]))
-            text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
-            score = detector.evaluate(text, perturbations, seed)["neural_discrepancy"]
-            target = row["target"]
-            total[target] += 1
-            if score is not None:
-                scored[target] += 1
-                scores.append(score)
-                labels.append(target)
-                weights.append(row["weight"])
-
-    if set(labels) != {0, 1}:
-        raise ValueError(f"в {split} нужны оценки для обоих классов")
-    coverage = {name: dict(total=total[label], scored=scored[label])
-                for label, name in ((0, "human"), (1, "edited"))}
-    return scores, labels, weights, coverage
-
-
-def evaluate_dataset(dataset, detector, limit=50, perturbations=5, seed=42, max_fpr=0.2):
+def evaluate_dataset(dataset, detectors, limit=50, perturbations=4, seed=42, max_fpr=0.2):
     if limit < 1 or perturbations < 1 or not 0 <= max_fpr <= 1:
         raise ValueError("нужны положительные limit и perturbations, max-fpr должен быть от 0 до 1")
     records = read_dataset(dataset)
-    scores, labels, weights, validation_coverage = evaluate_split(
-        records, "validation", detector, limit, perturbations, seed)
-    calibration = calibrate(scores, labels, weights, max_fpr)
+    reports = {name: dict(mask_model=model.mask_name, eval_model=model.eval_name,
+                          perturbations=perturbations, seed=seed, coverage={})
+               for name, model in detectors.items()}
+    parser = EmailParser()
+    chart = {}
 
-    scores, labels, weights, test_coverage = evaluate_split(
-        records, "test", detector, limit, perturbations, seed)
-    probabilities = [sigmoid(calibration["weight"] * score + calibration["bias"]) for score in scores]
-    test = calculate_metrics(probabilities, labels, weights, calibration["threshold"])
-    raw_auc = calculate_metrics([sigmoid(score) for score in scores], labels, weights)["roc_auc"]
-    return dict(mask_model=detector.mask_name, eval_model=detector.eval_name, limit_groups=limit,
-                perturbations=perturbations, seed=seed, calibration=calibration, test=test,
-                test_raw_roc_auc=raw_auc, coverage=dict(validation=validation_coverage, test=test_coverage))
+    for split in ("validation", "test"):
+        groups = defaultdict(list)
+        for row in records:
+            if row["split"] == split:
+                groups[row["group_id"]].append(row)
+        names = sorted(groups)
+        random.Random(seed).shuffle(names)
+        selected = names[:limit]
+        observations = []
+        seconds = defaultdict(float)
+        for name in selected:
+            group = []
+            for row in groups[name]:
+                parsed = parser.parse_from_file(row["path"])
+                text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
+                values = {}
+                for key, model in detectors.items():
+                    start = perf_counter()
+                    values[key] = model.evaluate(text, perturbations, seed)["neural_discrepancy"]
+                    seconds[key] += perf_counter() - start
+                group.append((row["target"], row["weight"], values))
+            if all(value is not None for _, _, values in group for value in values.values()):
+                observations.extend(group)
+
+        if {label for label, _, _ in observations} != {0, 1}:
+            raise ValueError(f"в {split} нужны оцениваемые пары для обоих классов")
+        labels = [label for label, _, _ in observations]
+        weights = [weight for _, weight, _ in observations]
+        for key, report in reports.items():
+            scores = [values[key] for _, _, values in observations]
+            report["coverage"][split] = dict(groups_selected=len(selected), emails_scored=len(scores),
+                                             emails_selected=sum(len(groups[name]) for name in selected),
+                                             inference_seconds=round(seconds[key], 3))
+            if split == "validation":
+                report["calibration"] = calibrate(scores, labels, weights, max_fpr)
+                continue
+            cal = report["calibration"]
+            probabilities = [sigmoid(cal["weight"] * score + cal["bias"]) for score in scores]
+            report["test"] = calculate_metrics(probabilities, labels, weights, cal["threshold"])
+            report["test_raw_roc_auc"] = calculate_metrics([sigmoid(x) for x in scores], labels, weights)["roc_auc"]
+            chart[key] = (labels, probabilities, cal["threshold"])
+    return reports, chart
 
 
-def main():
+def main(roberta_default=False):
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("--dataset", type=Path, default=BASE_DIR / "datasets" / "PASTED" / "data")
+    colab = Path("/content/datasets/PASTED/data")
+    cli.add_argument("--dataset", type=Path, default=colab if colab.is_dir() else BASE_DIR / "datasets/PASTED/data")
     cli.add_argument("--output", type=Path)
     cli.add_argument("--limit", type=int, default=50, help="групп в каждом разбиении")
-    cli.add_argument("--perturbations", type=int, default=5)
+    cli.add_argument("--perturbations", type=int, default=4)
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--max-fpr", type=float, default=0.2)
+    mode = cli.add_mutually_exclusive_group()
+    mode.add_argument("--roberta", action="store_true", default=roberta_default)
+    mode.add_argument("--compare", action="store_true", help="проверить оба варианта на одинаковых парах")
+    cli.add_argument("--plot", type=Path)
     args = cli.parse_args()
     try:
-        print_json(evaluate_dataset(args.dataset, get_detector(), args.limit,
-                                    args.perturbations, args.seed, args.max_fpr), args.output)
+        detectors = {}
+        if not args.roberta or args.compare:
+            detectors["distilbert"] = get_detector()
+        if args.roberta or args.compare:
+            from neural_roberta import get_detector as get_roberta
+
+            detectors["roberta"] = get_roberta()
+        reports, chart = evaluate_dataset(args.dataset, detectors, args.limit, args.perturbations,
+                                          args.seed, args.max_fpr)
+        print_json(reports if args.compare else next(iter(reports.values())), args.output)
+        if args.plot is not None:
+            from evaluate_roberta import plot_report
+
+            name = "roberta" if "roberta" in chart else "distilbert"
+            plot_report(*chart[name], args.plot)
     except (OSError, ValueError, ImportError, RuntimeError) as error:
         print_error(error)
         return 1

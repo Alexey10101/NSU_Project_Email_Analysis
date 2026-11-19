@@ -1,2 +1,4 @@
 beautifulsoup4>=4.12,<5
 catboost==1.2.10
+numpy
+Pillow>=10

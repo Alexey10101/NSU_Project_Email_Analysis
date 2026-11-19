@@ -164,7 +164,7 @@ def calibrate(logits, labels, weights, max_fpr=0.2):
     threshold, metrics = max((row for row in valid if row[1]["fpr"] <= max_fpr),
                              key=lambda row: (row[1]["f1"], -row[1]["fpr"], row[0]))
     return dict(weight=weight, bias=bias, threshold=threshold, max_fpr=max_fpr,
-                fitted_on="validation", validation_metrics=metrics)
+                fitted_on="validation", usable=metrics["f1"] > 0, validation_metrics=metrics)
 
 
 def split_summary(records):

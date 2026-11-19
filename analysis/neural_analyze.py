@@ -1,9 +1,10 @@
 """
-нейросетевой анализ письма по абзацам методом текстовых возмущений.
-distilbert заменяет слова, qwen оценивает изменение предсказуемости текста.
+Нейросетевой анализ письма по абзацам методом текстовых возмущений.
+Distilbert заменяет слова, qwen оценивает изменение предсказуемости текста.
 """
 
 import argparse
+import json
 import math
 import random
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from model_utils import analyze_path, print_error, print_json
 from parser import EmailParser, clean_email_body
+from text_analyze import sigmoid
 
 
 class PerturbationDetector:
@@ -102,7 +104,7 @@ def get_detector():
     return _detector
 
 
-def analyze_email_from_file(file_path, n_perturbations=5, seed=42):
+def analyze_email_from_file(file_path, n_perturbations=4, seed=42):
     parsed = EmailParser().parse_from_file(file_path)
     text = clean_email_body(parsed.text_plain or parsed.extracted_text_from_html)
     return dict(subject=parsed.subject, **get_detector().evaluate(text, n_perturbations, seed))
@@ -112,16 +114,43 @@ def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("file", type=Path, help="письмо или папка с eml")
     cli.add_argument("--output", type=Path)
-    cli.add_argument("--perturbations", type=int, default=5)
+    cli.add_argument("--roberta", action="store_true", help="использовать RoBERTa-large и Qwen2.5-1.5B")
+    cli.add_argument("--perturbations", type=int, default=4)
+    cli.add_argument("--calibration", type=Path, help="json-отчёт проверки нейросети")
     cli.add_argument("--seed", type=int, default=42)
     args = cli.parse_args()
-    if args.perturbations < 1:
+    if args.perturbations is not None and args.perturbations < 1:
         cli.error("--perturbations должно быть положительным")
     try:
-        result = analyze_path(args.file, analyze_email_from_file, "neural_ai_status",
-                              n_perturbations=args.perturbations, seed=args.seed)
+        analyze = analyze_email_from_file
+        detector = get_detector
+        if args.roberta:
+            from neural_roberta import analyze_email_from_file as analyze, get_detector as detector
+        report = json.loads(args.calibration.read_text(encoding="utf-8")) if args.calibration else None
+        if report and "calibration" not in report:
+            report = report["roberta" if args.roberta else "distilbert"]
+        if report:
+            model = detector()
+            expected = (model.mask_name, model.eval_name, args.perturbations, args.seed)
+            actual = tuple(report[key] for key in ("mask_model", "eval_model", "perturbations", "seed"))
+            if expected != actual:
+                raise ValueError("калибровка рассчитана для других настроек")
+            cal = report["calibration"]
+            if not cal.get("usable", True):
+                raise ValueError("на validation не найден рабочий порог")
+
+        def evaluate(path):
+            result = analyze(path, args.perturbations, args.seed)
+            score = result["neural_discrepancy"]
+            if report and score is not None:
+                probability = sigmoid(cal["weight"] * score + cal["bias"])
+                result["neural_ai_score"] = round(probability * 100, 1)
+                result["neural_ai_verdict"] = "AI-Edited" if probability >= cal["threshold"] else "Human-Written"
+            return result
+
+        result = analyze_path(args.file, evaluate, "neural_ai_status")
         print_json(result, args.output)
-    except (OSError, ValueError, ImportError, RuntimeError) as error:
+    except (OSError, ValueError, KeyError, ImportError, RuntimeError) as error:
         print_error(error)
         return 1
     return 0
