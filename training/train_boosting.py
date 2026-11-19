@@ -16,7 +16,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR / "analysis"))
 
-from boosting_analyze import FEATURE_NAMES
+from boosting_analyze import FEATURE_NAMES, NEURAL_FEATURES
 from model_utils import calculate_metrics, calibrate, save_json
 from text_analyze import sigmoid
 
@@ -32,7 +32,8 @@ def read_table(table_path):
     if not table_path.is_file():
         raise ValueError("сначала запусти training/build_table.py")
     description = json.loads(table_path.with_suffix(".json").read_text(encoding="utf-8"))
-    if description.get("version") != 1 or description.get("feature_names") != list(FEATURE_NAMES):
+    names = FEATURE_NAMES + (NEURAL_FEATURES if "neural" in description else ())
+    if description.get("version") != 1 or description.get("feature_names") != list(names):
         raise ValueError("формат таблицы изменился, нужно пересоздать её через build_table.py")
     digest = hashlib.sha256(table_path.read_bytes()).hexdigest()
     if description["table_sha256"] != digest:
@@ -46,7 +47,7 @@ def read_table(table_path):
         row["sample_weight"] = float(row["sample_weight"])
         if row["target"] not in (0, 1) or row["split"] not in ("train", "validation", "test"):
             raise ValueError("некорректная метка или разбиение в таблице")
-        for name in FEATURE_NAMES:
+        for name in names:
             row[name] = float(row[name])
             if not math.isfinite(row[name]):
                 raise ValueError(f"некорректное число в признаке {name}")
@@ -73,7 +74,7 @@ def read_table(table_path):
 
 
 def train_model(table_path=TABLE_PATH, model_dir=MODEL_DIR, report_path=REPORT_PATH, log_dir=LOG_DIR,
-                iterations=300, max_fpr=0.2):
+                iterations=300, max_fpr=0.2, use_neural=True):
     from catboost import CatBoostClassifier, Pool
     import catboost
 
@@ -86,6 +87,9 @@ def train_model(table_path=TABLE_PATH, model_dir=MODEL_DIR, report_path=REPORT_P
     has_html_training = html_labels == {0, 1} and len(html_groups) >= 20
     features = [name for name in FEATURE_NAMES if name.startswith("text_") or has_html_training]
     used_blocks = ["text_features"] + (["html_features"] if has_html_training else [])
+    if "neural" in description and use_neural:
+        features.extend(NEURAL_FEATURES)
+        used_blocks.append("neural_features")
     pools = {split: Pool([[row[name] for name in features] for row in rows],
                          label=[row["target"] for row in rows], weight=[row["sample_weight"] for row in rows],
                          feature_names=features) for split, rows in parts.items()}
@@ -112,16 +116,20 @@ def train_model(table_path=TABLE_PATH, model_dir=MODEL_DIR, report_path=REPORT_P
     temporary.replace(model_path)
     digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     calibration["model_sha256"] = digest
-    metadata = dict(version=1, model_sha256=digest, feature_names=features, mode="feature_baseline",
+    metadata = dict(version=1, model_sha256=digest, feature_names=features, mode="neural_features" if "neural_features" in used_blocks else "feature_baseline",
                     used_blocks=used_blocks, missing_blocks=["llm", "image"], catboost_version=catboost.__version__,
                     parameters=parameters, table_sha256=description["table_sha256"], datasets=description["datasets"],
                     splits={split: dict(emails=len(rows), groups=len({row["group_id"] for row in rows}))
                             for split, rows in parts.items()},
                     train_groups=sorted({row["group_id"] for row in train}),
                     note="обучена модель по доступным признакам; объединение четырёх готовых оценок требует общего размеченного набора")
+    if "neural_features" in used_blocks:
+        metadata["neural"] = description["neural"]
+        metadata["missing_blocks"] = ["image"]
     report = dict(model_sha256=digest, mode=metadata["mode"], used_blocks=used_blocks, splits=metadata["splits"],
                   threshold=calibration["threshold"], validation=calibration["validation_metrics"], test=metrics,
-                  feature_importance={name: float(value) for name, value in zip(features, model.feature_importances_)},
+                  feature_importance={name: float(value) if math.isfinite(value) else None
+                                      for name, value in zip(features, model.feature_importances_)},
                   meets_quality_target=metrics["f1"] >= 0.7 and metrics["roc_auc"] >= 0.7 and metrics["fpr"] <= 0.2,
                   note="калибровка и порог получены только на validation; test использован один раз для итоговой проверки")
     save_json(model_dir / "catboost_calibration.json", calibration)
@@ -140,9 +148,10 @@ if __name__ == "__main__":
     cli.add_argument("--logs", type=Path, default=LOG_DIR)
     cli.add_argument("--iterations", type=int, default=300)
     cli.add_argument("--max-fpr", type=float, default=0.2)
+    cli.add_argument("--without-neural", action="store_true")
     args = cli.parse_args()
     try:
-        train_model(args.table, args.models, args.report, args.logs, args.iterations, args.max_fpr)
+        train_model(args.table, args.models, args.report, args.logs, args.iterations, args.max_fpr, not args.without_neural)
     except (OSError, ValueError, KeyError, ImportError) as error:
         print(f"ошибка обучения catboost: {error}", file=sys.stderr)
         sys.exit(1)
